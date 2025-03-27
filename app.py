@@ -5,20 +5,19 @@ import time
 import uuid
 import signal
 import shutil
-import optional
 import subprocess
 from pathlib import Path
-from typing import Dict, Any, List
-from flask import Flask, request, jsonify, render_template, session
-import subprocess
-import shutil
-from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, Any, List, Optional
 import re
 import random
 import openai
 from flask import Flask, request, jsonify, render_template, session
 import logging
+from cachetools import TTLCache
+import os
+from flask import request, jsonify
+from dotenv import load_dotenv
+load_dotenv()  # Load environment variables from .env file
 
 # Configure logging
 logging.basicConfig(
@@ -26,14 +25,102 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+app = Flask(__name__, template_folder='templates')
+app.secret_key = os.urandom(24)
+app.config['MAX_CONTENT_LENGTH'] = 1 * 1024 * 1024  # 1MB max-limit
+app.config['MAX_CACHE_SIZE'] = 1000  # 1000 questions in cache
+app.config['CACHE_TTL'] = 3600  # 1 hour TTL
+app.config['PERMANENT_SESSION_LIFETIME'] = 1800  # 30 minutes
 
-# OpenAI client for generating questions
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# Initialize OpenAI client
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+@app.route('/api/chat-completion', methods=['POST'])
+def chat_completion():
+    """Handle chat completion requests from the Coding Buddy"""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid request data',
+                'message': "I couldn't process your message. Please try again."
+            }), 400
+
+        user_message = data.get('user_message', '').strip()
+        if not user_message:
+            return jsonify({
+                'success': False,
+                'error': 'Empty message',
+                'message': "Please type a message first."
+            }), 400
+
+        # Check if OpenAI API key is set
+        if not OPENAI_API_KEY:
+            logger.error("OpenAI API key is not set")
+            return jsonify({
+                'success': False,
+                'error': 'API key not configured',
+                'message': "OpenAI API key is not configured. Please set the OPENAI_API_KEY environment variable."
+            }), 500
+
+        # Construct the context for the AI
+        system_prompt = """You are a helpful coding assistant. Help the user with their programming questions and challenges."""
+        user_context = f"USER QUESTION: {user_message}"
+
+        # Add additional context if available
+        if data.get('question_info'):
+            user_context += f"\n\nCURRENT QUESTION: {data['question_info']}"
+        if data.get('code_solution'):
+            user_context += f"\n\nUSER'S CODE: {data['code_solution']}"
+        if data.get('test_results'):
+            user_context += f"\n\nTEST RESULTS: {data['test_results']}"
+
+        logger.info("Calling OpenAI API...")
+        
+        try:
+            response = openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_context}
+                ],
+                temperature=0.7,
+                max_tokens=800
+            )
+            
+            ai_message = response.choices[0].message.content.strip()
+            logger.info("Successfully received OpenAI response")
+            
+            return jsonify({
+                'success': True,
+                'message': ai_message
+            })
+            
+        except Exception as openai_error:
+            logger.error(f"OpenAI API error: {str(openai_error)}")
+            return jsonify({
+                'success': False,
+                'error': str(openai_error),
+                'message': "Error connecting to OpenAI API. Please check your API key and try again."
+            }), 500
+
+    except Exception as e:
+        logger.error(f"Error in chat completion: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'message': "An unexpected error occurred. Please try again."
+        }), 500
 # This is a conceptual implementation of Pynguine
 class Pynguine:
     @staticmethod
+
     def generate_tests(function_signature: str, description: str, examples: List[Dict] = None, num_tests: int = 5) -> List[Dict[str, Any]]:
         """
         Generate test cases based on function signature, description, and examples.
@@ -48,23 +135,51 @@ class Pynguine:
             List of test cases with inputs and expected outputs
         """
         # Extract function name and parameters
-        match = re.match(r'def\s+(\w+)\s*\((.*?)\)', function_signature)
-        if not match:
-            raise ValueError("Invalid function signature")
+        # Improved regex to handle multiline signatures and more flexible whitespace
+        if "def " in function_signature:
+            # For function-based questions
+            signature_line = [line for line in function_signature.split('\n') if "def " in line][0]
+            match = re.match(r'def\s+(\w+)\s*\((.*?)\)', signature_line)
             
-        function_name = match.group(1)
-        params_str = match.group(2)
-        
-        # Parse parameters
-        params = []
-        if params_str:
-            for param in params_str.split(','):
-                param = param.strip()
-                if ':' in param:
-                    name, type_hint = param.split(':', 1)
-                    params.append((name.strip(), type_hint.strip()))
-                else:
-                    params.append((param, None))
+            if not match:
+                # Try a more flexible regex as fallback
+                match = re.search(r'def\s+(\w+)\s*\((.*?)\)(?:\s*->.*?)?:', function_signature, re.DOTALL)
+                
+            if not match:
+                logger.error(f"Failed to parse function signature: {function_signature}")
+                # Default parameters to avoid crashing
+                function_name = "solution"
+                params = [("input", None)]
+            else:
+                function_name = match.group(1)
+                params_str = match.group(2)
+                
+                # Parse parameters
+                params = []
+                if params_str:
+                    for param in params_str.split(','):
+                        param = param.strip()
+                        if not param:
+                            continue
+                        if ':' in param:
+                            name, type_hint = param.split(':', 1)
+                            params.append((name.strip(), type_hint.strip()))
+                        else:
+                            params.append((param, None))
+        elif "class " in function_signature:
+            # Handle class-based questions
+            match = re.match(r'class\s+(\w+)', function_signature)
+            if match:
+                function_name = match.group(1)
+                params = [("self", None)]  # Default parameter for class
+            else:
+                function_name = "Solution"
+                params = [("self", None)]
+        else:
+            # Fallback for unrecognized formats
+            logger.warning(f"Unrecognized function signature format: {function_signature}")
+            function_name = "solution"
+            params = [("input", None)]
         
         # Start with example test cases if provided
         test_cases = []
@@ -88,7 +203,8 @@ class Pynguine:
             
             # Generate inputs based on parameter names and types
             for param_name, param_type in params:
-                test_case["inputs"][param_name] = Pynguine._generate_sample_input(param_name, param_type, description)
+                if param_name != 'self':  # Skip 'self' parameter for class methods
+                    test_case["inputs"][param_name] = Pynguine._generate_sample_input(param_name, param_type, description)
             
             # Generate expected output based on function name and inputs
             test_case["expected_output"] = Pynguine._generate_expected_output(
@@ -101,44 +217,42 @@ class Pynguine:
     
     @staticmethod
     def _generate_sample_input(param_name: str, param_type: Optional[str], description: str) -> Any:
-        """Generate appropriate sample input based on parameter name and type hint"""
-        # This is a simplified version - a real implementation would be more sophisticated
-        
+        """Generate simpler sample input based on parameter name and type hint"""
         # Check type hint first if available
         if param_type:
             if 'int' in param_type:
-                return random.randint(-100, 100)
+                return random.randint(-10, 10)  # Smaller range than before
             elif 'float' in param_type:
-                return round(random.uniform(-100, 100), 2)
+                return round(random.uniform(-10, 10), 1)  # Fewer decimal places
             elif 'str' in param_type:
-                return f"test_string_{random.randint(1, 100)}"
+                return f"test_{random.randint(1, 5)}"  # Shorter strings
             elif 'list' in param_type or 'List' in param_type:
-                # Try to determine list type
+                # Try to determine list type, but keep lists shorter
                 if 'int' in param_type:
-                    return [random.randint(-10, 10) for _ in range(random.randint(3, 7))]
+                    return [random.randint(-5, 5) for _ in range(random.randint(2, 4))]
                 elif 'str' in param_type:
-                    return [f"item_{i}" for i in range(random.randint(3, 7))]
+                    return [f"item_{i}" for i in range(random.randint(2, 3))]
                 else:
-                    return [random.randint(-10, 10) for _ in range(random.randint(3, 7))]
+                    return [random.randint(-5, 5) for _ in range(random.randint(2, 4))]
             elif 'dict' in param_type or 'Dict' in param_type:
-                return {f"key_{i}": random.randint(1, 100) for i in range(random.randint(2, 5))}
+                return {f"k{i}": random.randint(1, 5) for i in range(random.randint(1, 3))}
             elif 'bool' in param_type:
                 return random.choice([True, False])
         
         # If no type hint or unsupported type, infer from parameter name
         if 'num' in param_name or 'count' in param_name or 'index' in param_name:
-            return random.randint(1, 100)
+            return random.randint(1, 10)  # Smaller numbers
         elif 'name' in param_name or 'text' in param_name or 'str' in param_name:
-            return f"sample_{param_name}_{random.randint(1, 100)}"
+            return f"sample_{random.randint(1, 3)}"  # Shorter strings
         elif 'list' in param_name or 'array' in param_name:
-            return [random.randint(1, 100) for _ in range(random.randint(3, 7))]
+            return [random.randint(1, 5) for _ in range(random.randint(2, 4))]  # Shorter lists
         elif 'dict' in param_name or 'map' in param_name:
-            return {f"key_{i}": random.randint(1, 100) for i in range(random.randint(2, 5))}
+            return {f"k{i}": random.randint(1, 5) for i in range(random.randint(1, 2))}  # Smaller dicts
         elif 'flag' in param_name or 'enable' in param_name:
             return random.choice([True, False])
         else:
-            # Default to string if we can't determine type
-            return f"default_value_for_{param_name}"
+            # Default to a simple string
+            return f"input_{random.randint(1, 3)}"
     
     @staticmethod
     def _generate_expected_output(function_name: str, inputs: Dict[str, Any], description: str) -> Any:
@@ -280,10 +394,37 @@ class LLMQuestionGenerator:
     def __init__(self):
         self.client = openai_client
         self.previous_questions = set()
-        self.use_local_questions = not bool(OPENAI_API_KEY.strip())  # If no API key, use local questions
+        self.use_local_questions = False  # Always attempt to use LLM first
+
+    def generate_question(self, difficulty: str = "medium", topic: str = None) -> Dict[str, Any]:
+        """Generate a Python coding question using LLM"""
+        try:
+            # Use OpenAI API to generate the question
+            if OPENAI_API_KEY:
+                try:
+                    question_text = self._generate_raw_question(difficulty, topic)
+                    question_info = self._parse_question(question_text)
+                    
+                    # If we don't have a valid question, fall back to default
+                    if not question_info.get('function_name'):
+                        logger.warning("LLM generated question didn't have required fields")
+                        return self._get_local_question(difficulty, topic)
+                    
+                    question_info['difficulty'] = difficulty
+                    return {"success": True, "question": question_info}
+                except Exception as e:
+                    logger.error(f"Error generating question with LLM: {e}")
+                    return self._get_local_question(difficulty, topic)
+            else:
+                logger.info("No OpenAI API key provided, using local questions")
+                return self._get_local_question(difficulty, topic)
+                
+        except Exception as e:
+            logger.error(f"Error generating question: {e}")
+            return self._get_local_question("medium", None)  # Default fallback
 
     def _get_local_questions(self) -> Dict[str, List[Dict[str, str]]]:
-        """Return a dictionary of pre-defined local questions"""
+        """Return a dictionary of pre-defined local questions for fallback"""
         return {
             "easy": [
                 {
@@ -293,6 +434,10 @@ class LLMQuestionGenerator:
                         ("Input: [1, 3, 2, 5, 4]", "Output: 4"),
                         ("Input: [1, 1, 1]", "Output: -1"),
                         ("Input: [7]", "Output: -1")
+                    ],
+                    "constraints": [
+                        "1 <= len(arr) <= 10^5",
+                        "-10^9 <= arr[i] <= 10^9"
                     ]
                 },
                 {
@@ -302,6 +447,10 @@ class LLMQuestionGenerator:
                         ("Input: 'hello'", "Output: 2"),
                         ("Input: 'PYTHON'", "Output: 1"),
                         ("Input: ''", "Output: 0")
+                    ],
+                    "constraints": [
+                        "0 <= len(text) <= 10^4",
+                        "text consists of printable ASCII characters"
                     ]
                 }
             ],
@@ -313,6 +462,10 @@ class LLMQuestionGenerator:
                         ("Input: 'listen', 'silent'", "Output: True"),
                         ("Input: 'Hello World', 'World Hello'", "Output: True"),
                         ("Input: 'Python', 'Java'", "Output: False")
+                    ],
+                    "constraints": [
+                        "0 <= len(str1), len(str2) <= 5 * 10^4",
+                        "str1 and str2 consist of printable ASCII characters"
                     ]
                 },
                 {
@@ -322,6 +475,10 @@ class LLMQuestionGenerator:
                         ("Input: 'leetcode'", "Output: 'l'"),
                         ("Input: 'hello'", "Output: 'h'"),
                         ("Input: 'aabb'", "Output: ''")
+                    ],
+                    "constraints": [
+                        "1 <= len(s) <= 10^5",
+                        "s consists of only lowercase English letters"
                     ]
                 }
             ],
@@ -333,6 +490,10 @@ class LLMQuestionGenerator:
                         ("Input: 'babad'", "Output: 'bab'"),
                         ("Input: 'cbbd'", "Output: 'bb'"),
                         ("Input: 'a'", "Output: 'a'")
+                    ],
+                    "constraints": [
+                        "1 <= len(s) <= 1000",
+                        "s consists of only lowercase English letters"
                     ]
                 },
                 {
@@ -342,45 +503,60 @@ class LLMQuestionGenerator:
                         ("cache = LRUCache(2)", "None"),
                         ("cache.put(1, 1)", "None"),
                         ("cache.get(1)", "Returns: 1")
+                    ],
+                    "constraints": [
+                        "1 <= capacity <= 3000",
+                        "0 <= key <= 10^4",
+                        "0 <= value <= 10^5",
+                        "At most 2 * 10^5 calls will be made to get and put"
                     ]
                 }
             ]
         }
 
-    def generate_question(self, difficulty: str = "medium", topic: str = None) -> Dict[str, Any]:
-        """Generate a Python coding question"""
-        try:
-            if self.use_local_questions:
-                return self._get_local_question(difficulty, topic)
-            
-            try:
-                question_text = self._generate_raw_question(difficulty, topic)
-                question_info = self._parse_question(question_text)
-                return {"success": True, "question": question_info}
-            except (openai.RateLimitError, openai.APIError) as e:
-                logger.warning(f"OpenAI API error, falling back to local questions: {e}")
-                return self._get_local_question(difficulty, topic)
-                
-        except Exception as e:
-            logger.error(f"Error generating question: {e}")
-            return self._get_local_question("medium", None)  # Default fallback
-
     def _get_local_question(self, difficulty: str, topic: str = None) -> Dict[str, Any]:
-        """Get a random local question based on difficulty"""
+        """Get a random local question based on difficulty (for fallback)"""
         questions = self._get_local_questions()
         difficulty = difficulty.lower() if difficulty else "medium"
         if difficulty not in questions:
             difficulty = "medium"
         
         question = random.choice(questions[difficulty])
+        
+        # Format examples for frontend
+        formatted_examples = []
+        for input_text, output_text in question["examples"]:
+            formatted_examples.append({
+                "input_text": input_text,
+                "output_text": output_text
+            })
+        
         return {
             "success": True,
             "question": {
                 "problem_statement": question["problem"],
                 "function_signature": question["signature"],
-                "examples": question["examples"]
+                "examples": formatted_examples,
+                "constraints": question["constraints"],
+                "difficulty": difficulty,
+                "function_name": self._extract_function_name(question["signature"])
             }
         }
+    
+    def _extract_function_name(self, signature: str) -> str:
+        """Extract function name from signature"""
+        if signature.startswith("class"):
+            # For class-based questions, return the class name
+            match = re.match(r'class\s+(\w+)', signature)
+            if match:
+                return match.group(1)
+            return "Solution"
+        else:
+            # For function-based questions
+            match = re.match(r'def\s+(\w+)', signature)
+            if match:
+                return match.group(1)
+            return "solution"
 
     def _generate_raw_question(self, difficulty: str, topic: str = None) -> str:
         """Generate raw question text using OpenAI's API"""
@@ -404,7 +580,7 @@ class LLMQuestionGenerator:
             
         except Exception as e:
             logger.error(f"OpenAI API error: {e}")
-            return self._get_default_raw_question(difficulty, topic)
+            raise
 
     def _construct_prompt(self, difficulty: str, topic: str = None) -> str:
         """Construct the prompt for OpenAI API"""
@@ -427,67 +603,18 @@ class LLMQuestionGenerator:
         Output: [exact expected output]
 
         [Provide at least 3 test cases with varied inputs]
+        
+        Constraints:
+        [List any constraints on input size, value ranges, etc.]
         """
 
-    def _get_default_raw_question(self, difficulty: str, topic: str = None) -> str:
-        """Return a default question text when API fails"""
-        default_questions = {
-            "easy": """Problem Statement:
-Write a function that finds the second largest element in a list of integers. If the list has fewer than 2 elements, return -1.
-
-Function Signature:
-def find_second_largest(arr: List[int]) -> int:
-
-Examples:
-Input: [1, 3, 2, 5, 4]
-Output: 4
-
-Input: [1, 1, 1]
-Output: -1
-
-Input: [7]
-Output: -1""",
-            "medium": """Problem Statement:
-Write a function that checks if two strings are anagrams of each other, ignoring spaces and case.
-
-Function Signature:
-def are_anagrams(str1: str, str2: str) -> bool:
-
-Examples:
-Input: "listen", "silent"
-Output: True
-
-Input: "Hello World", "World Hello"
-Output: True
-
-Input: "Python", "Java"
-Output: False""",
-            "hard": """Problem Statement:
-Write a function that finds the longest palindromic substring in a given string.
-
-Function Signature:
-def longest_palindrome(s: str) -> str:
-
-Examples:
-Input: "babad"
-Output: "bab"
-
-Input: "cbbd"
-Output: "bb"
-
-Input: "a"
-Output: "a" """
-        }
-        
-        return default_questions.get(difficulty, default_questions["medium"])
-    
     def _parse_question(self, question_text: str) -> Dict[str, Any]:
         """Parse the raw question text into structured format"""
         try:
             # Basic validation of question text
             if not question_text or not isinstance(question_text, str):
                 logger.error(f"Invalid question text received: {question_text}")
-                return self._get_local_question("medium", None)['question']
+                raise ValueError("Invalid question text format")
 
             # Extract components
             lines = question_text.strip().split('\n')
@@ -496,60 +623,90 @@ Output: "a" """
             function_signature = ""
             imports = []
             examples = []
+            constraints = []
             function_name = None
             
             current_section = None
             current_example = {}
+            in_code_block = False
+            code_lines = []
             
             for line in lines:
-                line = line.strip()
-                if not line:
+                line_stripped = line.strip()
+                if not line_stripped:
                     continue
                 
-                if line.startswith('Problem Statement:'):
+                # Handle code blocks with triple backticks
+                if line_stripped == '```' or line_stripped == '```python':
+                    in_code_block = not in_code_block
+                    if line_stripped == '```python':
+                        current_section = "signature"
+                    continue
+                    
+                if line_stripped.startswith('Problem Statement:'):
                     current_section = "problem"
                     continue
-                elif line.startswith('Function Signature:'):
+                elif line_stripped.startswith('Function Signature:'):
                     current_section = "signature"
                     continue
-                elif line.startswith('Examples:'):
+                elif line_stripped.startswith('Examples:'):
                     current_section = "examples"
                     continue
-                elif line.startswith('from typing import'):
-                    imports.append(line)
+                elif line_stripped.startswith('Constraints:'):
+                    current_section = "constraints"
+                    continue
+                elif line_stripped.startswith('from typing import'):
+                    imports.append(line_stripped)
+                    if current_section != "signature":
+                        current_section = "signature"
+                    continue
+                
+                if in_code_block and (current_section == "signature" or not current_section):
+                    # Collect all code lines within triple backticks
+                    code_lines.append(line)
+                    if line_stripped.startswith('def '):
+                        match = re.match(r'def\s+(\w+)\s*\(', line_stripped)
+                        if match:
+                            function_name = match.group(1)
+                    elif line_stripped.startswith('class '):
+                        match = re.match(r'class\s+(\w+)', line_stripped)
+                        if match:
+                            function_name = match.group(1)
                     continue
                 
                 if current_section == "problem":
-                    if line != "Function Signature:":  # Avoid capturing next section header
-                        problem_statement += line + " "
-                elif current_section == "signature":
-                    if line.startswith('def '):
-                        function_signature = line
+                    problem_statement += line + " "
+                elif current_section == "signature" and not in_code_block:
+                    if line_stripped.startswith('def ') or line_stripped.startswith('class '):
+                        function_signature = line_stripped
                         # Extract function name from signature
-                        match = re.match(r'def\s+(\w+)\s*\(', line)
-                        if match:
-                            function_name = match.group(1)
+                        if line_stripped.startswith('def '):
+                            match = re.match(r'def\s+(\w+)\s*\(', line_stripped)
+                            if match:
+                                function_name = match.group(1)
+                        else:
+                            match = re.match(r'class\s+(\w+)', line_stripped)
+                            if match:
+                                function_name = match.group(1)
                 elif current_section == "examples":
-                    if line.lower().startswith('input:'):
-                        if current_example.get('input'):  # Save previous example if exists
+                    if line_stripped.lower().startswith('input:'):
+                        if current_example.get('input_text'):  # Save previous example if exists
                             examples.append(current_example.copy())
-                        current_example = {'input': line[6:].strip()}
-                    elif line.lower().startswith('output:') and current_example.get('input'):
-                        current_example['output'] = line[7:].strip()
+                        current_example = {'input_text': line}
+                    elif line_stripped.lower().startswith('output:') and current_example.get('input_text'):
+                        current_example['output_text'] = line
                         examples.append(current_example.copy())
                         current_example = {}
+                elif current_section == "constraints":
+                    constraints.append(line_stripped)
+
+            # If we collected code inside triple backticks, use it
+            if code_lines and not function_signature:
+                function_signature = '\n'.join(code_lines)
 
             # Add last example if pending
-            if current_example.get('input') and current_example.get('output'):
+            if current_example.get('input_text') and current_example.get('output_text'):
                 examples.append(current_example)
-
-            # Format examples for return
-            formatted_examples = []
-            for example in examples:
-                formatted_examples.extend([
-                    f"Input: {example['input']}",
-                    f"Output: {example['output']}"
-                ])
 
             # If List is used in signature but import is missing, add it
             if 'List[' in function_signature and not any('typing import List' in imp for imp in imports):
@@ -557,102 +714,43 @@ Output: "a" """
 
             # Combine imports and function signature
             full_signature = '\n'.join(imports + [function_signature]) if imports else function_signature
+            
+            # Add default constraints if none were parsed
+            if not constraints:
+                if 'int' in full_signature.lower():
+                    constraints.append('-10^9 <= values <= 10^9')
+                if 'list' in full_signature.lower() or 'array' in full_signature.lower():
+                    constraints.append('1 <= array length <= 10^5')
+                if 'str' in full_signature.lower():
+                    constraints.append('1 <= string length <= 10^4')
                 
             # Ensure we have all required components
-            if not problem_statement or not function_signature or not function_name:
-                logger.error("Failed to parse question components")
-                return self._get_local_question("medium", None)['question']
+            if not problem_statement.strip():
+                logger.error("No problem statement found")
+                raise ValueError("Missing problem statement")
+                
+            if not full_signature.strip():
+                logger.error("No function signature found")
+                raise ValueError("Missing function signature")
+                
+            if not function_name:
+                logger.warning("No function name extracted, using default")
+                function_name = "solution"  # Default name
+            
+            # Log successful parsing
+            logger.info(f"Successfully parsed question with function: {function_name}")
             
             return {
                 "problem_statement": problem_statement.strip(),
-                "function_signature": full_signature,
+                "function_signature": full_signature.strip(),
                 "function_name": function_name,
-                "examples": formatted_examples
+                "examples": examples,
+                "constraints": constraints
             }
             
         except Exception as e:
             logger.exception("Error parsing question")
-            return self._get_local_question("medium", None)['question']
-    
-    def _get_default_question(self, difficulty: str, topic: str) -> Dict[str, Any]:
-        """Return a default question in case the API fails"""
-        default_questions = {
-            "arrays": {
-                "easy": {
-                    "problem_statement": "Write a function that finds the second largest element in an array. Return -1 if the array has fewer than 2 elements.",
-                    "function_signature": "def find_second_largest(arr: List[int]) -> int:\n    pass",
-                    "function_name": "find_second_largest",
-                    "parameters": [{"name": "arr", "type": "List[int]"}],
-                    "return_type": "int",
-                    "examples": [
-                        {"input": {"arr": [1, 3, 2, 5, 4]}, "output": 4},
-                        {"input": {"arr": [1, 1, 1]}, "output": -1},
-                        {"input": {"arr": [7]}, "output": -1}
-                    ]
-                },
-                "medium": {
-                    "problem_statement": "Write a function that finds the length of the longest subarray where the difference between any two elements is at most k.",
-                    "function_signature": "def longest_subarray_with_diff_k(arr: List[int], k: int) -> int:\n    pass",
-                    "function_name": "longest_subarray_with_diff_k",
-                    "parameters": [{"name": "arr", "type": "List[int]"}, {"name": "k", "type": "int"}],
-                    "return_type": "int",
-                    "examples": [
-                        {"input": {"arr": [1, 5, 3, 2, 6], "k": 2}, "output": 3},
-                        {"input": {"arr": [4, 4, 4, 4], "k": 0}, "output": 4},
-                        {"input": {"arr": [10, 1, 2, 3], "k": 1}, "output": 3}
-                    ]
-                },
-                "hard": {
-                    "problem_statement": "Write a function that returns the minimum number of intervals to remove to make the remaining intervals non-overlapping.",
-                    "function_signature": "def min_intervals_to_remove(intervals: List[List[int]]) -> int:\n    pass",
-                    "function_name": "min_intervals_to_remove",
-                    "parameters": [{"name": "intervals", "type": "List[List[int]]"}],
-                    "return_type": "int",
-                    "examples": [
-                        {"input": {"intervals": [[1,4], [2,3], [3,6]]}, "output": 1},
-                        {"input": {"intervals": [[1,2], [2,3]]}, "output": 0},
-                        {"input": {"intervals": [[1,2], [1,2], [1,2]]}, "output": 2}
-                    ]
-                }
-            },
-            "strings": {
-                "easy": {
-                    "problem_statement": "Write a function that counts the frequency of each character in a string and returns the first character that appears exactly once. Return None if no such character exists.",
-                    "function_signature": "def first_unique_char(s: str) -> Optional[str]:\n    pass",
-                    "function_name": "first_unique_char",
-                    "parameters": [{"name": "s", "type": "str"}],
-                    "return_type": "Optional[str]",
-                    "examples": [
-                        {"input": {"s": "statistics"}, "output": "a"},
-                        {"input": {"s": "aabb"}, "output": None},
-                        {"input": {"s": "x"}, "output": "x"}
-                    ]
-                }
-            },
-            "trees": {
-                "medium": {
-                    "problem_statement": "Write a function that finds the sum of all values in a binary tree at a given depth level (root is at level 0).",
-                    "function_signature": "def sum_at_level(root: Optional[TreeNode], level: int) -> int:\n    pass",
-                    "function_name": "sum_at_level",
-                    "parameters": [{"name": "root", "type": "Optional[TreeNode]"}, {"name": "level", "type": "int"}],
-                    "return_type": "int",
-                    "examples": [
-                        {"input": {"root": [1,2,3,4,5,6,7], "level": 2}, "output": 22},
-                        {"input": {"root": [1], "level": 0}, "output": 1},
-                        {"input": {"root": [], "level": 1}, "output": 0}
-                    ]
-                }
-            }
-        }
-
-        if topic in default_questions and difficulty in default_questions[topic]:
-            question = default_questions[topic][difficulty].copy()
-        else:
-            question = default_questions["arrays"]["medium"].copy()
-
-        question["difficulty"] = difficulty
-        question["topic"] = topic
-        return question
+            raise
 
 
 class QuestionInfo:
@@ -664,11 +762,15 @@ class QuestionInfo:
     
     def validate_and_normalize(self):
         """Validate and normalize question information"""
-        required_fields = ['problem_statement', 'function_signature', 'function_name']
+        required_fields = ['problem_statement', 'function_signature']
         for field in required_fields:
             if not self.raw_info.get(field):
                 raise ValueError(f"Missing required field: {field}")
         
+        # Make sure we have a function name
+        if 'function_name' not in self.raw_info:
+            self.raw_info['function_name'] = self._extract_function_name(self.raw_info['function_signature'])
+            
         # Extract parameters from function signature if not already present
         if 'parameters' not in self.raw_info:
             self.raw_info['parameters'] = self._extract_parameters(self.raw_info['function_signature'])
@@ -676,13 +778,45 @@ class QuestionInfo:
         # Normalize parameters
         self.raw_info['parameters'] = self._normalize_parameters(self.raw_info['parameters'])
         
-        # Normalize examples
-        self.raw_info['examples'] = self._normalize_examples(
-            self.raw_info.get('examples', [])
-        )
+        # Normalize examples for test case generation
+        if 'examples' in self.raw_info:
+            # Convert examples to format for test case generation
+            normalized_examples = []
+            for example in self.raw_info['examples']:
+                if 'input_text' in example and 'output_text' in example:
+                    # Parse input and output text
+                    inputs = self._parse_input_text(example['input_text'], self.raw_info['parameters'])
+                    output = self._parse_output_text(example['output_text'])
+                    
+                    normalized_examples.append({
+                        "inputs": inputs,
+                        "output": output
+                    })
+            
+            self.raw_info['normalized_examples'] = normalized_examples
+                
+        # Ensure constraints exist
+        if 'constraints' not in self.raw_info or not self.raw_info['constraints']:
+            self.raw_info['constraints'] = ['1 <= input size <= 10^5']
+
+    def _extract_function_name(self, function_signature: str) -> str:
+        """Extract function name from the signature"""
+        if function_signature.startswith("class"):
+            match = re.match(r'class\s+(\w+)', function_signature)
+            if match:
+                return match.group(1)
+        else:
+            match = re.match(r'def\s+(\w+)', function_signature)
+            if match:
+                return match.group(1)
+        return "solution"  # Default name
 
     def _extract_parameters(self, function_signature: str) -> List[Dict[str, str]]:
         """Extract parameters from function signature"""
+        # Check if it's a class
+        if function_signature.startswith("class"):
+            return []  # For class-based questions, don't extract params
+            
         # Match everything between parentheses
         match = re.search(r'\((.*?)\)', function_signature)
         if not match:
@@ -695,6 +829,9 @@ class QuestionInfo:
         parameters = []
         for param in params_str.split(','):
             param = param.strip()
+            if not param or param == 'self':
+                continue
+                
             if ':' in param:
                 name, type_hint = param.split(':', 1)
                 parameters.append({
@@ -719,37 +856,49 @@ class QuestionInfo:
                     'type': param.get('type', 'Any')
                 })
         return normalized
-
-    def _normalize_examples(self, examples: List[str]) -> List[Dict[str, Any]]:
-        """Normalize example information"""
-        normalized = []
-        current_input = None
-        
-        for example in examples:
-            if example.lower().startswith('input:'):
-                current_input = example[6:].strip()
-            elif example.lower().startswith('output:') and current_input is not None:
-                normalized.append({
-                    'inputs': {'s': current_input},  # Assuming single parameter for now
-                    'output': example[7:].strip()
-                })
-                current_input = None
-                
-        return normalized or [{'inputs': {'s': 'example'}, 'output': False}]
-
-    def get_parameter_info(self, param_name: str) -> Dict[str, Any]:
-        """Get information about a specific parameter"""
-        for param in self.raw_info['parameters']:
-            if param['name'] == param_name:
-                return param
-        return {'name': param_name, 'type': 'Any', 'optional': False}
     
-    def is_optional_parameter(self, param_name: str) -> bool:
-        """Check if a parameter is optional"""
-        param_info = self.get_parameter_info(param_name)
-        return param_info.get('optional', False)
-
-
+    def _parse_input_text(self, input_text: str, parameters: List[Dict[str, str]]) -> Dict[str, Any]:
+        """Parse the input text from examples into a dictionary of inputs"""
+        # Remove "Input: " prefix
+        input_text = input_text.replace("Input:", "").strip()
+        
+        # Try to parse as Python literal
+        try:
+            # For multi-parameter functions, try to match params by position
+            input_values = eval(input_text)
+            
+            # If input_values is a tuple or list and we have multiple parameters
+            if isinstance(input_values, (list, tuple)) and len(parameters) > 1:
+                return {param['name']: val for param, val in zip(parameters, input_values)}
+            
+            # If we have a single parameter
+            if len(parameters) == 1:
+                return {parameters[0]['name']: input_values}
+                
+            # Default case
+            if len(parameters) > 0:
+                return {parameters[0]['name']: input_values}
+            else:
+                return {"input": input_values}
+                
+        except (SyntaxError, ValueError, NameError):
+            # If we can't parse it directly, just use a default parameter name
+            if len(parameters) > 0:
+                return {parameters[0]['name']: input_text}
+            else:
+                return {"input": input_text}
+    
+    def _parse_output_text(self, output_text: str) -> Any:
+        """Parse the output text from examples"""
+        # Remove "Output: " prefix
+        output_text = output_text.replace("Output:", "").strip()
+        
+        # Try to parse as Python literal
+        try:
+            return eval(output_text)
+        except (SyntaxError, ValueError, NameError):
+            # If we can't parse it, return as string
+            return output_text
 class TestCaseGenerator:
     """Main class for generating test cases from LLM Python questions"""
     
@@ -762,65 +911,21 @@ class TestCaseGenerator:
         # Convert raw question info to QuestionInfo object
         info = QuestionInfo(question_info)
         
-        # Start with example test cases if provided
-        test_cases = []
-        for i, example in enumerate(info.raw_info['examples']):
-            test_cases.append({
-                "test_id": i + 1,
-                "is_example": True,
-                "inputs": example["inputs"],
-                "expected_output": example["output"]
-            })
+        # Use normalized examples if available
+        examples = info.raw_info.get('normalized_examples', [])
         
-        # Generate additional test cases
-        remaining_tests = num_tests - len(test_cases)
-        for i in range(remaining_tests):
-            test_case = self._generate_single_test_case(info, i + len(test_cases) + 1)
-            test_cases.append(test_case)
+        # Generate tests using Pynguine
+        function_signature = info.raw_info['function_signature']
+        problem_statement = info.raw_info['problem_statement']
+        
+        test_cases = self.pynguine.generate_tests(
+            function_signature=function_signature,
+            description=problem_statement,
+            examples=examples,
+            num_tests=num_tests
+        )
         
         return test_cases
-    
-    def _generate_single_test_case(self, info: QuestionInfo, test_id: int) -> Dict[str, Any]:
-        """Generate a single test case"""
-        inputs = {}
-        
-        # Handle each parameter
-        for param in info.raw_info['parameters']:
-            param_name = param['name']
-            
-            # Skip optional parameters based on probability
-            if (info.is_optional_parameter(param_name) and 
-                random.random() < self.skip_optional_probability):
-                continue
-            
-            # Generate parameter value based on type
-            param_type = param['type']
-            inputs[param_name] = self._generate_parameter_value(param_type)
-        
-        return {
-            "test_id": test_id,
-            "is_example": False,
-            "inputs": inputs,
-            "expected_output": self._compute_expected_output(info, inputs)
-        }
-    
-    def _generate_parameter_value(self, param_type: str) -> Any:
-        """Generate a value for a parameter based on its type"""
-        # Add your parameter generation logic here
-        # This is a simplified version
-        if 'int' in param_type.lower():
-            return random.randint(-100, 100)
-        elif 'str' in param_type.lower():
-            return ''.join(random.choices('abcdefghijklmnopqrstuvwxyz', k=5))
-        elif 'list' in param_type.lower():
-            return [random.randint(-10, 10) for _ in range(random.randint(1, 5))]
-        return None
-    
-    def _compute_expected_output(self, info: QuestionInfo, inputs: Dict[str, Any]) -> Any:
-        """Compute expected output for given inputs"""
-        # This should be implemented based on your specific needs
-        # For now, return None as placeholder
-        return None
     
     def format_test_code(self, question_info: Dict[str, Any], test_cases: List[Dict[str, Any]]) -> str:
         """
@@ -845,6 +950,10 @@ class TestCaseGenerator:
         
         # Add test cases
         for i, test in enumerate(test_cases):
+            # Ensure inputs is a dictionary
+            if not isinstance(test["inputs"], dict):
+                test["inputs"] = {"input": test["inputs"]}
+                
             inputs_str = ", ".join([f"{k}={repr(v)}" for k, v in test["inputs"].items()])
             expected = repr(test["expected_output"])
             
@@ -1033,7 +1142,7 @@ class CodeTester:
 
 
 # Initialize Flask app with proper configuration
-app = Flask(__name__)
+app = Flask(__name__, template_folder='templates')
 app.secret_key = os.urandom(24)
 app.config['MAX_CONTENT_LENGTH'] = 1 * 1024 * 1024  # 1MB max-limit
 app.config['MAX_CACHE_SIZE'] = 1000  # 1000 questions in cache
@@ -1042,11 +1151,10 @@ app.config['PERMANENT_SESSION_LIFETIME'] = 1800  # 30 minutes
 
 # Initialize components
 question_generator = LLMQuestionGenerator()
-test_case_generator = TestCaseGenerator()
+test_case_generator = TestCaseGenerator(Pynguine())
 code_tester = CodeTester()
 
 # Use a proper cache with expiration
-from cachetools import TTLCache
 questions_db = TTLCache(maxsize=1000, ttl=3600)  # 1 hour TTL
 
 @app.before_request
@@ -1083,19 +1191,33 @@ def generate_question():
             return jsonify({'success': False, 'error': 'Invalid difficulty level'}), 400
         
         try:
-            question_info = question_generator.generate_question(difficulty, topic)
-            logger.info(f"Generated question info: {json.dumps(question_info)}")
+            # Generate the question using LLM
+            question_response = question_generator.generate_question(difficulty, topic)
+            logger.info(f"Generated question with difficulty: {difficulty}")
             
-            if not question_info.get('success'):
-                logger.error(f"Question generation failed: {question_info.get('error', 'Unknown error')}")
-                return jsonify(question_info), 400
+            if not question_response.get('success'):
+                logger.error(f"Question generation failed: {question_response.get('error', 'Unknown error')}")
+                return jsonify(question_response), 400
                 
-            test_cases = test_case_generator.generate_test_cases(question_info['question'])
-            test_code = test_case_generator.format_test_code(question_info['question'], test_cases)
+            question_info = question_response['question']
             
+            # Ensure we have required fields in question_info
+            required_fields = ['problem_statement', 'function_signature', 'function_name']
+            for field in required_fields:
+                if field not in question_info:
+                    return jsonify({
+                        'success': False, 
+                        'error': f'Generated question missing required field: {field}'
+                    }), 500
+            
+            # Generate test cases using Pynguine
+            test_cases = test_case_generator.generate_test_cases(question_info)
+            test_code = test_case_generator.format_test_code(question_info, test_cases)
+            
+            # Store the question and test cases
             question_id = str(uuid.uuid4())
             questions_db[question_id] = {
-                'question_info': question_info['question'],
+                'question_info': question_info,
                 'test_cases': test_cases,
                 'test_code': test_code,
                 'created_at': time.time()
@@ -1103,11 +1225,14 @@ def generate_question():
             
             session['current_question_id'] = question_id
             
+            # Extract only example test cases for the response
+            example_test_cases = [tc for tc in test_cases if tc.get('is_example', False)]
+            
             return jsonify({
                 'success': True,
                 'question_id': question_id,
-                'question_info': question_info['question'],
-                'example_test_cases': [tc for tc in test_cases if tc.get('is_example', False)]
+                'question_info': question_info,
+                'example_test_cases': example_test_cases
             })
             
         except Exception as e:
@@ -1170,10 +1295,13 @@ def get_question(question_id):
                 'error': 'Question not found or expired'
             }), 404
         
+        # Extract only example test cases for the response
+        example_test_cases = [tc for tc in question_data['test_cases'] if tc.get('is_example', False)]
+        
         return jsonify({
             'success': True,
             'question_info': question_data['question_info'],
-            'example_test_cases': [tc for tc in question_data['test_cases'] if tc.get('is_example', False)]
+            'example_test_cases': example_test_cases
         })
         
     except Exception as e:
@@ -1197,18 +1325,6 @@ def favicon():
 
 if __name__ == '__main__':
     try:
-        # Initialize components
-        question_generator = LLMQuestionGenerator()
-        test_case_generator = TestCaseGenerator()
-        code_tester = CodeTester()
-        
-        # Initialize cache
-        from cachetools import TTLCache
-        questions_db = TTLCache(
-            maxsize=app.config['MAX_CACHE_SIZE'],
-            ttl=app.config['CACHE_TTL']
-        )
-        
         # Start the application
         app.run(
             host='0.0.0.0',
