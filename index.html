@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM Coding Practice Platform</title>
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Monaco Editor -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min/vs/loader.js"></script>
+    <style>
+        body {
+            padding-top: 20px;
+            padding-bottom: 40px;
+        }
+        .question-container {
+            margin-bottom: 20px;
+        }
+        .editor-container {
+            height: 400px;
+            border: 1px solid #ccc;
+            margin-bottom: 20px;
+        }
+        .test-case {
+            padding: 10px;
+            margin-bottom: 10px;
+            border-radius: 5px;
+        }
+        .test-case.passed {
+            background-color: #d4edda;
+        }
+        .test-case.failed {
+            background-color: #f8d7da;
+        }
+        .hidden {
+            display: none;
+        }
+        .loader {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 2s linear infinite;
+            margin: 20px auto;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        #controls {
+            margin-bottom: 20px;
+        }
+        .difficulty-badge {
+            font-size: 1rem;
+            padding: 5px 10px;
+            margin-left: 10px;
+        }
+        .badge-easy {
+            background-color: #28a745;
+        }
+        .badge-medium {
+            background-color: #ffc107;
+            color: #212529;
+        }
+        .badge-hard {
+            background-color: #dc3545;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="mb-4">LLM Coding Practice Platform</h1>
+        
+        <div id="controls" class="row g-3">
+            <div class="col-md-4">
+                <div class="form-floating">
+                    <select class="form-select" id="difficulty">
+                        <option value="easy">Easy</option>
+                        <option value="medium" selected>Medium</option>
+                        <option value="hard">Hard</option>
+                    </select>
+                    <label for="difficulty">Difficulty</label>
+                </div>
+            </div>
+            
+            <div class="col-md-4">
+                <div class="form-floating">
+                    <select class="form-select" id="topic">
+                        <option value="" selected>Any Topic</option>
+                        <option value="arrays">Arrays</option>
+                        <option value="strings">Strings</option>
+                        <option value="linked-lists">Linked Lists</option>
+                        <option value="trees">Trees</option>
+                        <option value="recursion">Recursion</option>
+                        <option value="dynamic-programming">Dynamic Programming</option>
+                    </select>
+                    <label for="topic">Topic</label>
+                </div>
+            </div>
+            
+            <div class="col-md-4">
+                <button class="btn btn-primary w-100 h-100" id="generate-btn">Generate New Question</button>
+            </div>
+        </div>
+        
+        <!-- Loading Indicator -->
+        <div id="loading" class="hidden">
+            <div class="loader"></div>
+            <p class="text-center">Generating question...</p>
+        </div>
+        
+        <!-- Question Container -->
+        <div id="question-container" class="question-container hidden">
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h2 class="mb-0" id="question-title">Problem Title</h2>
+                    <span id="question-difficulty" class="badge difficulty-badge">Medium</span>
+                </div>
+                <div class="card-body">
+                    <div id="question-description">
+                        <!-- Question description will be inserted here -->
+                    </div>
+                    
+                    <h4 class="mt-4">Function Signature:</h4>
+                    <pre><code id="function-signature">def solution(param1, param2):</code></pre>
+                    
+                    <h4 class="mt-4">Examples:</h4>
+                    <div id="examples-container">
+                        <!-- Examples will be inserted here -->
+                    </div>
+                    
+                    <h4 class="mt-4">Constraints:</h4>
+                    <ul id="constraints-list">
+                        <!-- Constraints will be inserted here -->
+                    </ul>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Editor Container -->
+        <div id="editor-container" class="editor-container hidden">
+            <div id="code-editor" style="height: 100%; width: 100%;"></div>
+        </div>
+        
+        <!-- Submit Button -->
+        <div id="submit-container" class="text-center hidden">
+            <button class="btn btn-success btn-lg" id="submit-btn">Submit Solution</button>
+        </div>
+        
+        <!-- Results Container -->
+        <div id="results-container" class="hidden">
+            <div class="card">
+                <div class="card-header">
+                    <h3 class="mb-0">Test Results</h3>
+                </div>
+                <div class="card-body">
+                    <div id="summary" class="alert mb-4">
+                        <!-- Summary will be inserted here -->
+                    </div>
+                    
+                    <h4>Test Cases:</h4>
+                    <div id="test-cases">
+                        <!-- Test cases will be inserted here -->
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Global variables
+        let editor;
+        let currentQuestionId;
+        let loadedFunction;
+        
+        // Initialize Monaco Editor
+        require.config({ paths: { 'vs': 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.44.0/min/vs' }});
+        require(['vs/editor/editor.main'], function() {
+            editor = monaco.editor.create(document.getElementById('code-editor'), {
+                value: '# Write your solution here\n',
+                language: 'python',
+                theme: 'vs-dark',
+                automaticLayout: true,
+                minimap: { enabled: false }
+            });
+        });
+        
+        // Generate Question Button
+        document.getElementById('generate-btn').addEventListener('click', generateQuestion);
+        
+        // Submit Solution Button
+        document.getElementById('submit-btn').addEventListener('click', submitSolution);
+        
+        async function generateQuestion() {
+            const difficulty = document.getElementById('difficulty').value;
+            const topic = document.getElementById('topic').value;
+            
+            // Show loading indicator
+            document.getElementById('loading').classList.remove('hidden');
+            document.getElementById('question-container').classList.add('hidden');
+            document.getElementById('editor-container').classList.add('hidden');
+            document.getElementById('submit-container').classList.add('hidden');
+            document.getElementById('results-container').classList.add('hidden');
+            
+            try {
+                const response = await fetch('/api/generate-question', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        difficulty,
+                        topic: topic || undefined
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    displayQuestion(data);
+                } else {
+                    alert('Failed to generate question: ' + data.error);
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                alert('An error occurred while generating the question.');
+            } finally {
+                // Hide loading indicator
+                document.getElementById('loading').classList.add('hidden');
+            }
+        }
+        
+        function displayQuestion(data) {
+            currentQuestionId = data.question_id;
+            const questionInfo = data.question_info;
+            
+            // Set question title
+            document.getElementById('question-title').textContent = `Problem: ${questionInfo.function_name}`;
+            
+            // Set difficulty badge
+            const difficultyBadge = document.getElementById('question-difficulty');
+            difficultyBadge.textContent = questionInfo.difficulty.charAt(0).toUpperCase() + questionInfo.difficulty.slice(1);
+            difficultyBadge.className = `badge difficulty-badge badge-${questionInfo.difficulty}`;
+            
+            // Set description
+            document.getElementById('question-description').innerHTML = `<p>${questionInfo.problem_statement.replace(/\n/g, '<br>')}</p>`;
+            
+            // Set function signature
+            document.getElementById('function-signature').textContent = questionInfo.function_signature;
+            
+            // Set examples
+            const examplesContainer = document.getElementById('examples-container');
+            examplesContainer.innerHTML = '';
+            
+            questionInfo.examples.forEach((example, index) => {
+                const exampleDiv = document.createElement('div');
+                exampleDiv.classList.add('example', 'mb-3');
+                exampleDiv.innerHTML = `
+                    <p><strong>Example ${index + 1}:</strong></p>
+                    <p>Input: ${example.input_text}</p>
+                    <p>Output: ${example.output_text}</p>
+                `;
+                examplesContainer.appendChild(exampleDiv);
+            });
+            
+            // Set constraints
+            const constraintsList = document.getElementById('constraints-list');
+            constraintsList.innerHTML = '';
+            
+            questionInfo.constraints.forEach(constraint => {
+                const li = document.createElement('li');
+                li.textContent = constraint;
+                constraintsList.appendChild(li);
+            });
+            
+            // Update editor with function template
+            if (editor) {
+                loadedFunction = questionInfo.function_signature;
+                editor.setValue(questionInfo.function_signature + '\n    # Write your solution here\n    pass\n');
+            }
+            
+            // Show question and editor
+            document.getElementById('question-container').classList.remove('hidden');
+            document.getElementById('editor-container').classList.remove('hidden');
+            document.getElementById('submit-container').classList.remove('hidden');
+            document.getElementById('results-container').classList.add('hidden');
+        }
+        
+        async function submitSolution() {
+            if (!currentQuestionId) {
+                alert('No question is currently active.');
+                return;
+            }
+            
+            const code = editor.getValue();
+            
+            // Basic validation
+            if (!code.includes(loadedFunction)) {
+                alert('Please keep the function signature intact.');
+                return;
+            }
+            
+            // Show loading
+            document.getElementById('submit-btn').disabled = true;
+            document.getElementById('submit-btn').textContent = 'Running tests...';
+            
+            try {
+                const response = await fetch('/api/submit-solution', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        question_id: currentQuestionId,
+                        code
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    displayResults(data.results);
+                } else {
+                    alert('Failed to submit solution: ' + data.error);
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                alert('An error occurred while submitting your solution.');
+            } finally {
+                // Reset button
+                document.getElementById('submit-btn').disabled = false;
+                document.getElementById('submit-btn').textContent = 'Submit Solution';
+            }
+        }
+        
+        function displayResults(results) {
+            const resultsContainer = document.getElementById('results-container');
+            const summary = document.getElementById('summary');
+            const testCasesContainer = document.getElementById('test-cases');
+            
+            // Show results section
+            resultsContainer.classList.remove('hidden');
+            
+            // Update summary
+            if (results.success === false) {
+                summary.className = 'alert alert-danger';
+                summary.innerHTML = `<h4>Execution Error</h4><p>${results.error}</p>`;
+                testCasesContainer.innerHTML = '';
+                return;
+            }
+            
+            // Update summary based on passing ratio
+            const passingRatio = results.passing_ratio;
+            if (passingRatio === 1) {
+                summary.className = 'alert alert-success';
+                summary.innerHTML = `<h4>All Tests Passed!</h4>
+                    <p>You passed ${results.passed_tests} out of ${results.total_tests} tests.</p>`;
+            } else if (passingRatio >= 0.5) {
+                summary.className = 'alert alert-warning';
+                summary.innerHTML = `<h4>Some Tests Passed</h4>
+                    <p>You passed ${results.passed_tests} out of ${results.total_tests} tests.</p>`;
+            } else {
+                summary.className = 'alert alert-danger';
+                summary.innerHTML = `<h4>Most Tests Failed</h4>
+                    <p>You passed only ${results.passed_tests} out of ${results.total_tests} tests.</p>`;
+            }
+            
+            // Update test cases
+            testCasesContainer.innerHTML = '';
+            
+            // Sort test cases: examples first, then by test_id
+            const sortedResults = [...results.results].sort((a, b) => {
+                if (a.is_example && !b.is_example) return -1;
+                if (!a.is_example && b.is_example) return 1;
+                return a.test_id - b.test_id;
+            });
+            
+            sortedResults.forEach(test => {
+                const testDiv = document.createElement('div');
+                testDiv.classList.add('test-case');
+                
+                if (test.error) {
+                    testDiv.classList.add('failed');
+                    testDiv.innerHTML = `
+                        <h5>Test ${test.test_id} ${test.is_example ? '(Example)' : ''}: Failed with Error</h5>
+                        <p><strong>Inputs:</strong> ${JSON.stringify(test.inputs)}</p>
+                        <p><strong>Expected:</strong> ${JSON.stringify(test.expected_output)}</p>
+                        <p><strong>Error:</strong> ${test.error}</p>
+                    `;
+                } else if (test.passed) {
+                    testDiv.classList.add('passed');
+                    testDiv.innerHTML = `
+                        <h5>Test ${test.test_id} ${test.is_example ? '(Example)' : ''}: Passed</h5>
+                        <p><strong>Inputs:</strong> ${JSON.stringify(test.inputs)}</p>
+                        <p><strong>Expected:</strong> ${JSON.stringify(test.expected_output)}</p>
+                        <p><strong>Your Output:</strong> ${JSON.stringify(test.actual_output)}</p>
+                    `;
+                } else {
+                    testDiv.classList.add('failed');
+                    testDiv.innerHTML = `
+                        <h5>Test ${test.test_id} ${test.is_example ? '(Example)' : ''}: Failed</h5>
+                        <p><strong>Inputs:</strong> ${JSON.stringify(test.inputs)}</p>
+                        <p><strong>Expected:</strong> ${JSON.stringify(test.expected_output)}</p>
+                        <p><strong>Your Output:</strong> ${JSON.stringify(test.actual_output)}</p>
+                    `;
+                }
+                
+                testCasesContainer.appendChild(testDiv);
+            });
+            
+            // Scroll to results
+            resultsContainer.scrollIntoView({ behavior: 'smooth' });
+        }
+        
+        // Load a question when the page loads (optional)
+        //window.addEventListener('load', generateQuestion);
+    </script>
+</body>
+</html>
