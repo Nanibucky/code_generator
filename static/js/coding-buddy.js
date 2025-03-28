@@ -97,46 +97,62 @@ class CodingBuddy {
         }
     }
     
-    async processUserMessageWithAPI(message) {
-        // Show typing indicator
-        this.showTypingIndicator();
+    // Update the processUserMessageWithAPI function in coding-buddy.js
+
+async processUserMessageWithAPI(message) {
+    // Show typing indicator
+    this.showTypingIndicator();
+    
+    try {
+        console.log("Sending message to API:", message.substring(0, 30) + "...");
         
-        try {
-            // Call the backend API
-            const response = await fetch('/api/chat-completion', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({
-                    user_message: message,
-                    question_info: this.currentQuestion,
-                    code_solution: this.userSolution,
-                    test_results: this.lastTestResults
-                })
-            });
+        // Call the backend API
+        const response = await fetch('/api/chat-completion', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                user_message: message,
+                question_info: this.currentQuestion,
+                code_solution: this.userSolution,
+                test_results: this.lastTestResults
+            })
+        });
+        
+        console.log("Response status:", response.status);
+        
+        // Handle non-200 responses
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({
+                error: `Server error: ${response.status} ${response.statusText}`
+            }));
             
-            if (!response.ok) {
-                throw new Error(`API call failed with status: ${response.status}`);
-            }
+            console.error("API error:", errorData);
             
-            const data = await response.json();
-            
-            // Hide typing indicator
             this.hideTypingIndicator();
-            
-            // Display the response
-            if (data.success) {
-                this.addBuddyMessage(data.message);
-            } else {
-                throw new Error(data.error || "Unknown error");
-            }
-        } catch (error) {
-            console.error("Error processing message with API:", error);
-            this.hideTypingIndicator();
-            this.addBuddyMessage("I'm having trouble connecting. Could you try again?");
+            this.addBuddyMessage(`Error: ${errorData.message || errorData.error || 'Something went wrong with the request. Please try again later.'}`);
+            return;
         }
+        
+        const data = await response.json();
+        console.log("Response data received:", data.success);
+        
+        // Hide typing indicator
+        this.hideTypingIndicator();
+        
+        // Display the response
+        if (data.success) {
+            this.addBuddyMessage(data.message);
+        } else {
+            throw new Error(data.error || data.message || "Unknown error");
+        }
+    } catch (error) {
+        console.error("Error processing message with API:", error);
+        this.hideTypingIndicator();
+        this.addBuddyMessage(`Sorry, I encountered an error: ${error.message}. Please check the browser console for more details or try again later.`);
     }
+}
     
     addBuddyMessage(message) {
         const messagesContainer = document.getElementById('buddy-messages');
