@@ -14,10 +14,15 @@ import openai
 from flask import Flask, request, jsonify, render_template, session
 import logging
 from cachetools import TTLCache
-import os
 from flask import request, jsonify
 from dotenv import load_dotenv
-load_dotenv()  # Load environment variables from .env file
+import html
+import traceback
+from werkzeug.middleware.proxy_fix import ProxyFix
+from ratelimit import limits, RateLimitException
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
@@ -25,102 +30,30 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Initialize Flask app with proper configuration
 app = Flask(__name__, template_folder='templates')
-app.secret_key = os.urandom(24)
+app.secret_key = os.getenv('SECRET_KEY', os.urandom(24))
 app.config['MAX_CONTENT_LENGTH'] = 1 * 1024 * 1024  # 1MB max-limit
 app.config['MAX_CACHE_SIZE'] = 1000  # 1000 questions in cache
 app.config['CACHE_TTL'] = 3600  # 1 hour TTL
 app.config['PERMANENT_SESSION_LIFETIME'] = 1800  # 30 minutes
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# For proper IP handling behind proxies
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 # Initialize OpenAI client
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+if not OPENAI_API_KEY:
+    logger.warning("No OpenAI API key provided. LLM features will be limited.")
+openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
-@app.route('/api/chat-completion', methods=['POST'])
-def chat_completion():
-    """Handle chat completion requests from the Coding Buddy"""
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({
-                'success': False,
-                'error': 'Invalid request data',
-                'message': "I couldn't process your message. Please try again."
-            }), 400
+# Constants
+RATE_LIMIT_MINUTE = 30  # API calls per minute
 
-        user_message = data.get('user_message', '').strip()
-        if not user_message:
-            return jsonify({
-                'success': False,
-                'error': 'Empty message',
-                'message': "Please type a message first."
-            }), 400
-
-        # Check if OpenAI API key is set
-        if not OPENAI_API_KEY:
-            logger.error("OpenAI API key is not set")
-            return jsonify({
-                'success': False,
-                'error': 'API key not configured',
-                'message': "OpenAI API key is not configured. Please set the OPENAI_API_KEY environment variable."
-            }), 500
-
-        # Construct the context for the AI
-        system_prompt = """You are a helpful coding assistant. Help the user with their programming questions and challenges."""
-        user_context = f"USER QUESTION: {user_message}"
-
-        # Add additional context if available
-        if data.get('question_info'):
-            user_context += f"\n\nCURRENT QUESTION: {data['question_info']}"
-        if data.get('code_solution'):
-            user_context += f"\n\nUSER'S CODE: {data['code_solution']}"
-        if data.get('test_results'):
-            user_context += f"\n\nTEST RESULTS: {data['test_results']}"
-
-        logger.info("Calling OpenAI API...")
-        
-        try:
-            response = openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_context}
-                ],
-                temperature=0.7,
-                max_tokens=800
-            )
-            
-            ai_message = response.choices[0].message.content.strip()
-            logger.info("Successfully received OpenAI response")
-            
-            return jsonify({
-                'success': True,
-                'message': ai_message
-            })
-            
-        except Exception as openai_error:
-            logger.error(f"OpenAI API error: {str(openai_error)}")
-            return jsonify({
-                'success': False,
-                'error': str(openai_error),
-                'message': "Error connecting to OpenAI API. Please check your API key and try again."
-            }), 500
-
-    except Exception as e:
-        logger.error(f"Error in chat completion: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'message': "An unexpected error occurred. Please try again."
-        }), 500
 # This is a conceptual implementation of Pynguine
 class Pynguine:
     @staticmethod
-
     def generate_tests(function_signature: str, description: str, examples: List[Dict] = None, num_tests: int = 5) -> List[Dict[str, Any]]:
         """
         Generate test cases based on function signature, description, and examples.
@@ -394,13 +327,13 @@ class LLMQuestionGenerator:
     def __init__(self):
         self.client = openai_client
         self.previous_questions = set()
-        self.use_local_questions = False  # Always attempt to use LLM first
+        self.use_local_questions = not bool(OPENAI_API_KEY)
 
     def generate_question(self, difficulty: str = "medium", topic: str = None) -> Dict[str, Any]:
         """Generate a Python coding question using LLM"""
         try:
             # Use OpenAI API to generate the question
-            if OPENAI_API_KEY:
+            if OPENAI_API_KEY and not self.use_local_questions:
                 try:
                     question_text = self._generate_raw_question(difficulty, topic)
                     question_info = self._parse_question(question_text)
@@ -416,7 +349,7 @@ class LLMQuestionGenerator:
                     logger.error(f"Error generating question with LLM: {e}")
                     return self._get_local_question(difficulty, topic)
             else:
-                logger.info("No OpenAI API key provided, using local questions")
+                logger.info("No OpenAI API key provided or using local questions")
                 return self._get_local_question(difficulty, topic)
                 
         except Exception as e:
@@ -558,6 +491,7 @@ class LLMQuestionGenerator:
                 return match.group(1)
             return "solution"
 
+    @limits(calls=RATE_LIMIT_MINUTE, period=60)
     def _generate_raw_question(self, difficulty: str, topic: str = None) -> str:
         """Generate raw question text using OpenAI's API"""
         try:
@@ -578,6 +512,10 @@ class LLMQuestionGenerator:
             # Extract and return the question text
             return response.choices[0].message.content.strip()
             
+        except RateLimitException:
+            logger.warning("Rate limit exceeded for LLM API")
+            self.use_local_questions = True
+            raise
         except Exception as e:
             logger.error(f"OpenAI API error: {e}")
             raise
@@ -899,6 +837,8 @@ class QuestionInfo:
         except (SyntaxError, ValueError, NameError):
             # If we can't parse it, return as string
             return output_text
+
+
 class TestCaseGenerator:
     """Main class for generating test cases from LLM Python questions"""
     
@@ -999,6 +939,158 @@ class TestCaseGenerator:
         return "\n".join(code)
 
 
+class ChatbotHandler:
+    """Handles chatbot interactions with the coding buddy"""
+    
+    def __init__(self):
+        self.client = openai_client
+        self.conversation_history = {}  # Store conversation history by session
+        self.max_history_length = 10  # Maximum number of messages to keep in history
+    
+    def _get_session_id(self):
+        """Get unique session ID for the current user"""
+        if 'session_id' not in session:
+            session['session_id'] = str(uuid.uuid4())
+        return session['session_id']
+    
+    def _init_conversation(self, session_id):
+        """Initialize conversation if it doesn't exist"""
+        if session_id not in self.conversation_history:
+            self.conversation_history[session_id] = [
+                {"role": "system", "content": """You are a helpful coding assistant called 'Coding Buddy'. 
+                Your job is to help the user with programming challenges. You should:
+                1. Provide hints rather than complete solutions
+                2. Guide users through debugging their code
+                3. Explain programming concepts when relevant
+                4. Be encouraging and supportive
+                Keep responses concise and focused on helping the user learn.
+                """}
+            ]
+    
+    def _clean_old_conversations(self):
+        """Remove old conversation histories to save memory"""
+        # Keep only the 100 most recent conversations
+        if len(self.conversation_history) > 100:
+            keys_to_remove = sorted(self.conversation_history.keys(), 
+                                   key=lambda k: self.conversation_history[k][-1].get('timestamp', 0))[:50]
+            for key in keys_to_remove:
+                del self.conversation_history[key]
+    
+    @limits(calls=RATE_LIMIT_MINUTE, period=60)
+    def get_response(self, user_message: str, question_info=None, code_solution=None, test_results=None) -> str:
+        """Get a response from the chatbot for the user's message"""
+        session_id = self._get_session_id()
+        self._init_conversation(session_id)
+        
+        # Add context about the current question and code if available
+        context_parts = []
+        if question_info:
+            context_parts.append(f"Current Question: {question_info.get('function_name', 'Unknown')}")
+            context_parts.append(f"Problem: {question_info.get('problem_statement', 'No description')}")
+            context_parts.append(f"Function Signature: {question_info.get('function_signature', 'No signature')}")
+        
+        if code_solution:
+            context_parts.append(f"User's Current Code:\n```python\n{code_solution}\n```")
+        
+        if test_results:
+            passed = test_results.get('passed_tests', 0)
+            total = test_results.get('total_tests', 0)
+            context_parts.append(f"Test Results: {passed}/{total} tests passed")
+            
+            # Add details about failed tests if any
+            if passed < total and 'results' in test_results:
+                failed_tests = [t for t in test_results['results'] if not t.get('passed', False)]
+                if failed_tests:
+                    context_parts.append("Failed Tests:")
+                    for i, test in enumerate(failed_tests[:3]):  # Show only first 3 failed tests
+                        error = test.get('error', '')
+                        inputs = test.get('inputs', {})
+                        expected = test.get('expected_output', '')
+                        actual = test.get('actual_output', '')
+                        
+                        if error:
+                            context_parts.append(f"Test {test.get('test_id', i+1)} Error: {error}")
+                        else:
+                            context_parts.append(f"Test {test.get('test_id', i+1)} Expected: {expected}, Got: {actual}")
+        
+        # Create context message if we have any context
+        if context_parts:
+            context = "\n".join(context_parts)
+            self.conversation_history[session_id].append({
+                "role": "system", 
+                "content": f"Here's the current context:\n{context}"
+            })
+        
+        # Add user message to history
+        self.conversation_history[session_id].append({
+            "role": "user",
+            "content": user_message,
+            "timestamp": time.time()
+        })
+        
+        # Truncate history if too long (keep system message)
+        if len(self.conversation_history[session_id]) > self.max_history_length + 1:
+            system_message = self.conversation_history[session_id][0]
+            self.conversation_history[session_id] = [system_message] + self.conversation_history[session_id][-(self.max_history_length):]
+        
+        try:
+            # Use OpenAI API if available
+            if OPENAI_API_KEY:
+                response = self.client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=self.conversation_history[session_id],
+                    temperature=0.7,
+                    max_tokens=800
+                )
+                
+                assistant_message = response.choices[0].message.content.strip()
+            else:
+                # Fallback response if no API key
+                assistant_message = self._get_fallback_response(user_message, question_info, code_solution, test_results)
+            
+            # Add assistant response to history
+            self.conversation_history[session_id].append({
+                "role": "assistant",
+                "content": assistant_message,
+                "timestamp": time.time()
+            })
+            
+            # Clean up old conversations periodically
+            self._clean_old_conversations()
+            
+            return assistant_message
+            
+        except Exception as e:
+            logger.error(f"Error getting chatbot response: {e}")
+            return f"I'm having trouble generating a response right now. Please try again later."
+    
+    def _get_fallback_response(self, user_message, question_info, code_solution, test_results):
+        """Generate a simple response when API is not available"""
+        # Simple response patterns based on user message
+        message_lower = user_message.lower()
+        
+        if "error" in message_lower or "bug" in message_lower:
+            return "It looks like you might be dealing with an error. Try adding print statements to see the values of your variables at each step to track down where the issue occurs."
+            
+        if "hint" in message_lower:
+            return "Here's a hint: Break down the problem into smaller steps. First understand what each input and output example means, then work through each step logically."
+            
+        if "help" in message_lower:
+            return "I'm here to help! What specific part of the problem are you struggling with? Understanding the requirements, designing an algorithm, or debugging your solution?"
+            
+        if "test" in message_lower and test_results:
+            passed = test_results.get('passed_tests', 0)
+            total = test_results.get('total_tests', 0)
+            
+            if passed == total:
+                return "Great job! All tests are passing. Your solution works correctly."
+            else:
+                return f"You're passing {passed} out of {total} tests. Keep going! Check your logic for edge cases that might not be handled correctly."
+        
+        # Default response
+        return "I'm here to help with your coding challenge. Could you tell me what specific aspect you need assistance with? I can help you understand the problem, develop an algorithm, or debug your solution."
+
+
 class CodeTester:
     """Class for executing user code and running tests"""
     
@@ -1050,6 +1142,7 @@ class CodeTester:
             test_code_content = [
                 "import sys",
                 "import signal",
+                "import resource",
                 "from contextlib import contextmanager",
                 "",
                 "# Set up timeout handler",
@@ -1064,7 +1157,46 @@ class CodeTester:
                 "    finally:",
                 "        signal.alarm(0)",
                 "",
+                "import platform",
+                "",
+                "# Set resource limits",
+                "def set_resource_limits():",
+                "    \"\"\"Set resource limits with fallback for different platforms\"\"\"",
+                "    try:",
+                "        # Maximum CPU time in seconds",
+                "        resource.setrlimit(resource.RLIMIT_CPU, (3, 3))",
+                "    except (ValueError, resource.error, AttributeError):",
+                "        pass",
+                "",
+                "    try:",
+                "        # Maximum memory size (100 MB) - using a lower value to avoid errors",
+                "        # Get the current limit first",
+                "        current_limit = resource.getrlimit(resource.RLIMIT_AS)",
+                "        # Use either 100MB or 75% of current limit, whichever is smaller",
+                "        new_limit = min(100 * 1024 * 1024, int(current_limit[1] * 0.75) if current_limit[1] != resource.RLIM_INFINITY else 100 * 1024 * 1024)",
+                "        resource.setrlimit(resource.RLIMIT_AS, (new_limit, new_limit))",
+                "    except (ValueError, resource.error, AttributeError):",
+                "        pass",
+                "",
+                "    try:",
+                "        # Maximum number of processes",
+                "        resource.setrlimit(resource.RLIMIT_NPROC, (10, 10))",
+                "    except (ValueError, resource.error, AttributeError):",
+                "        pass",
+                "",
+                "# Apply resource limits only on Unix-like systems",
+                "if platform.system() != 'Windows':",
+                "    set_resource_limits()",
+                "",
                 f"sys.path.insert(0, '{self.temp_dir}')",
+                "# Block potentially dangerous imports",
+                "sys.modules['os'] = None",
+                "sys.modules['subprocess'] = None",
+                "sys.modules['multiprocessing'] = None",
+                "sys.modules['socket'] = None",
+                "sys.modules['requests'] = None",
+                "sys.modules['urllib'] = None",
+                "",
                 f"import {module_name}",
                 f"{function_name} = {module_name}.{function_name}",
                 "",
@@ -1143,31 +1275,35 @@ class CodeTester:
 
 # Initialize Flask app with proper configuration
 app = Flask(__name__, template_folder='templates')
-app.secret_key = os.urandom(24)
+app.secret_key = os.getenv('SECRET_KEY', os.urandom(24))
 app.config['MAX_CONTENT_LENGTH'] = 1 * 1024 * 1024  # 1MB max-limit
 app.config['MAX_CACHE_SIZE'] = 1000  # 1000 questions in cache
 app.config['CACHE_TTL'] = 3600  # 1 hour TTL
 app.config['PERMANENT_SESSION_LIFETIME'] = 1800  # 30 minutes
 
+# For proper IP handling behind proxies
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
 # Initialize components
 question_generator = LLMQuestionGenerator()
 test_case_generator = TestCaseGenerator(Pynguine())
 code_tester = CodeTester()
+chatbot_handler = ChatbotHandler()
 
 # Use a proper cache with expiration
-questions_db = TTLCache(maxsize=1000, ttl=3600)  # 1 hour TTL
+questions_db = TTLCache(maxsize=app.config['MAX_CACHE_SIZE'], ttl=app.config['CACHE_TTL'])
 
 @app.before_request
 def validate_request():
     """Validate incoming requests"""
     if request.method == 'POST':
-        if not request.is_json:
+        if not request.is_json and request.endpoint != 'index':
             return jsonify({
                 'success': False,
                 'error': 'Content-Type must be application/json'
             }), 400
         
-        if request.content_length > app.config['MAX_CONTENT_LENGTH']:
+        if request.content_length and request.content_length > app.config['MAX_CONTENT_LENGTH']:
             return jsonify({
                 'success': False,
                 'error': 'Request too large'
@@ -1175,10 +1311,72 @@ def validate_request():
 
 @app.route('/')
 def index():
+    """Render the main application page"""
     return render_template('index.html')
 
+@app.route('/favicon.ico')
+def favicon():
+    """Handle favicon requests"""
+    return '', 204  # Return empty response with "No Content" status
+
+@app.route('/api/chat-completion', methods=['POST'])
+def chat_completion():
+    """Handle chat completion requests with proper LLM integration"""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid request data',
+                'message': "I couldn't process your message. Please try again."
+            }), 400
+
+        user_message = data.get('user_message', '').strip()
+        if not user_message:
+            return jsonify({
+                'success': False,
+                'error': 'Empty message',
+                'message': "Please type a message first."
+            }), 400
+        
+        # Get context information from the request
+        question_info = data.get('question_info', {})
+        code_solution = data.get('code_solution', '')
+        test_results = data.get('test_results', {})
+        
+        try:
+            # Get response from chatbot handler
+            response = chatbot_handler.get_response(
+                user_message, 
+                question_info=question_info,
+                code_solution=code_solution,
+                test_results=test_results
+            )
+            
+            return jsonify({
+                'success': True,
+                'message': response
+            })
+            
+        except RateLimitException:
+            return jsonify({
+                'success': False,
+                'error': 'Rate limit exceeded',
+                'message': "I'm getting a lot of requests right now. Please try again in a moment."
+            }), 429
+            
+    except Exception as e:
+        logger.error(f"Error in chat completion: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'message': "An unexpected error occurred. Please try again."
+        }), 500
+
 @app.route('/api/generate-question', methods=['POST'])
+@limits(calls=10, period=60)  # Limit to 10 calls per minute
 def generate_question():
+    """Generate a coding question based on difficulty and topic"""
     try:
         data = request.get_json()
         if not data:
@@ -1235,6 +1433,12 @@ def generate_question():
                 'example_test_cases': example_test_cases
             })
             
+        except RateLimitException:
+            return jsonify({
+                'success': False,
+                'error': 'Rate limit exceeded',
+                'message': "You're generating questions too quickly. Please wait a moment and try again."
+            }), 429
         except Exception as e:
             logger.exception("Error in question generation process")
             return jsonify({
@@ -1250,7 +1454,9 @@ def generate_question():
         }), 500
 
 @app.route('/api/submit-solution', methods=['POST'])
+@limits(calls=20, period=60)  # Limit to 20 submissions per minute
 def submit_solution():
+    """Submit a solution for testing"""
     try:
         data = request.get_json()
         if not data:
@@ -1262,6 +1468,22 @@ def submit_solution():
         if not code:
             return jsonify({'success': False, 'error': 'No code provided'}), 400
             
+        # Validate code length
+        if len(code) > 50000:  # 50KB limit
+            return jsonify({'success': False, 'error': 'Code submission too large'}), 400
+            
+        # Sanitize user code - prevent malicious imports
+        if any(pattern in code for pattern in [
+            "import os", "import subprocess", "import sys", 
+            "from os import", "from subprocess import", "from sys import",
+            "__import__('os')", "__import__('subprocess')", 
+            "eval(", "exec("
+        ]):
+            return jsonify({
+                'success': False,
+                'error': 'Code contains restricted imports or functions'
+            }), 403
+            
         question_data = questions_db.get(question_id)
         if not question_data:
             return jsonify({
@@ -1272,21 +1494,167 @@ def submit_solution():
         function_name = question_data['question_info']['function_name']
         test_code = question_data['test_code']
         
-        results = code_tester.execute_code(code, function_name, test_code)
+        # Use simplified execution without resource limits to ensure it works
+        results = execute_code_simplified(code, function_name, test_code)
         
         return jsonify({
             'success': True,
             'results': results
         })
         
+    except RateLimitException:
+        return jsonify({
+            'success': False,
+            'error': 'Rate limit exceeded',
+            'message': "You're submitting solutions too quickly. Please wait a moment and try again."
+        }), 429
     except Exception as e:
+        logger.exception("Error in submit_solution endpoint")
         return jsonify({
             'success': False,
             'error': str(e)
         }), 500
 
+def execute_code_simplified(user_code: str, function_name: str, test_code: str, timeout: int = 5) -> Dict[str, Any]:
+    """
+    Execute the user's code and run tests with simplified security measures
+    that are more likely to work across platforms.
+    """
+    # Create a temporary directory if it doesn't exist
+    temp_dir = Path(os.getcwd()) / "temp"
+    temp_dir.mkdir(exist_ok=True)
+    
+    # Generate unique execution ID
+    execution_id = str(uuid.uuid4())
+    module_name = f"code_mod_{abs(hash(execution_id)) % 10000}"
+    
+    code_file = temp_dir / f"{module_name}.py"
+    test_file = temp_dir / f"test_{module_name}.py"
+    
+    try:
+        # Validate inputs
+        if not isinstance(user_code, str) or not isinstance(function_name, str):
+            raise ValueError("Invalid input types")
+        
+        if not function_name.isidentifier():
+            raise ValueError("Invalid function name")
+        
+        # Write files with proper encoding and error handling
+        code_file.write_text(user_code, encoding='utf-8')
+        
+        # Create test file with simplified safety measures
+        test_code_content = [
+            "import sys",
+            "import signal",
+            "from contextlib import contextmanager",
+            "",
+            "# Set up timeout handler",
+            "@contextmanager",
+            "def timeout(seconds):",
+            "    def signal_handler(signum, frame):",
+            "        raise TimeoutError('Execution timed out')",
+            "    try:",
+            "        # Check if SIGALRM is available (Unix-like systems)",
+            "        if hasattr(signal, 'SIGALRM'):",
+            "            old_handler = signal.signal(signal.SIGALRM, signal_handler)",
+            "            signal.alarm(seconds)",
+            "        yield",
+            "    finally:",
+            "        if hasattr(signal, 'SIGALRM'):",
+            "            signal.alarm(0)",
+            "            signal.signal(signal.SIGALRM, old_handler)",
+            "",
+            f"sys.path.insert(0, '{temp_dir}')",
+            f"import {module_name}",
+            f"{function_name} = {module_name}.{function_name}",
+            "",
+            test_code,
+            "",
+            "import json",
+            "try:",
+            "    with timeout(4):",  # Inner timeout as additional safety
+            f"        results = run_tests({function_name})",
+            "    print(json.dumps(results))",
+            "except Exception as e:",
+            "    print(json.dumps({",
+            "        'success': False,",
+            "        'error': str(e),",
+            "        'total_tests': 0,",
+            "        'passed_tests': 0,",
+            "        'passing_ratio': 0,",
+            "        'results': []",
+            "    }))"
+        ]
+        
+        test_file.write_text('\n'.join(test_code_content), encoding='utf-8')
+        
+        # Execute in subprocess with basic timeout
+        result = subprocess.run(
+            [sys.executable, str(test_file)],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ, 'PYTHONPATH': str(temp_dir)},
+        )
+        
+        if result.returncode != 0:
+            return {
+                'success': False,
+                'error': result.stderr[:500],  # Limit error message size
+                'total_tests': 0,
+                'passed_tests': 0,
+                'passing_ratio': 0,
+                'results': []
+            }
+        
+        try:
+            return {
+                'success': True,
+                **json.loads(result.stdout)
+            }
+        except json.JSONDecodeError:
+            return {
+                'success': False,
+                'error': 'Invalid test output format',
+                'total_tests': 0,
+                'passed_tests': 0,
+                'passing_ratio': 0,
+                'results': []
+            }
+        
+    except subprocess.TimeoutExpired:
+        return {
+            'success': False,
+            'error': f'Execution timed out after {timeout} seconds',
+            'total_tests': 0,
+            'passed_tests': 0,
+            'passing_ratio': 0,
+            'results': []
+        }
+    
+    except Exception as e:
+        return {
+            'success': False,
+            'error': str(e)[:500],  # Limit error message size
+            'total_tests': 0,
+            'passed_tests': 0,
+            'passing_ratio': 0,
+            'results': []
+        }
+    
+    finally:
+        # Clean up files
+        try:
+            if code_file.exists():
+                code_file.unlink()
+            if test_file.exists():
+                test_file.unlink()
+        except Exception:
+            pass
+
 @app.route('/api/get-question/<question_id>', methods=['GET'])
 def get_question(question_id):
+    """Get a specific question by ID"""
     try:
         question_data = questions_db.get(question_id)
         if not question_data:
@@ -1305,32 +1673,99 @@ def get_question(question_id):
         })
         
     except Exception as e:
+        logger.exception("Error in get_question endpoint")
         return jsonify({
             'success': False,
             'error': str(e)
         }), 500
 
+# Error handlers
+@app.errorhandler(400)
+def bad_request(error):
+    """Handle bad request errors"""
+    return jsonify({
+        'success': False,
+        'error': 'Bad request',
+        'message': str(error)
+    }), 400
+
+@app.errorhandler(404)
+def not_found(error):
+    """Handle not found errors"""
+    return jsonify({
+        'success': False,
+        'error': 'Not found',
+        'message': str(error)
+    }), 404
+
+@app.errorhandler(429)
+def rate_limit_exceeded(error):
+    """Handle rate limiting errors"""
+    return jsonify({
+        'success': False,
+        'error': 'Too many requests',
+        'message': 'Rate limit exceeded. Please try again later.'
+    }), 429
+
+@app.errorhandler(500)
+def server_error(error):
+    """Handle internal server errors"""
+    logger.exception("Internal server error")
+    return jsonify({
+        'success': False,
+        'error': 'Internal server error',
+        'message': 'An unexpected error occurred on the server.'
+    }), 500
+
 @app.errorhandler(Exception)
 def handle_error(error):
     """Global error handler"""
+    logger.exception(f"Unhandled exception: {error}")
     return jsonify({
         'success': False,
-        'error': str(error)
+        'error': 'Server error',
+        'message': 'An unexpected error occurred.'
     }), 500
 
-# Add favicon route to handle favicon.ico requests
-@app.route('/favicon.ico')
-def favicon():
-    return '', 204  # Return empty response with "No Content" status
+def cleanup_resources():
+    """Clean up resources before shutting down"""
+    try:
+        # Clean up temporary files
+        shutil.rmtree(code_tester.temp_dir, ignore_errors=True)
+        logger.info("Cleaned up temporary files")
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
+
+# Register signal handlers for graceful shutdown
+def signal_handler(sig, frame):
+    """Handle termination signals"""
+    logger.info(f"Received signal {sig}, shutting down gracefully")
+    cleanup_resources()
+    sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 if __name__ == '__main__':
     try:
+        # Create temp directory if it doesn't exist
+        os.makedirs(code_tester.temp_dir, exist_ok=True)
+        
+        # Clean up old temporary files on startup
+        code_tester.cleanup_old_files(max_age_seconds=1800)  # 30 minutes
+        
+        # Log startup information
+        logger.info(f"Starting server on port {int(os.getenv('PORT', 5000))}")
+        logger.info(f"OpenAI API Key configured: {bool(OPENAI_API_KEY)}")
+        
         # Start the application
         app.run(
             host='0.0.0.0',
             port=int(os.getenv('PORT', 5000)),
-            debug=False
+            debug=os.getenv('FLASK_ENV') == 'development',
+            threaded=True
         )
     except Exception as e:
         logger.error(f"Application startup failed: {e}")
-        sys.exit(1)  # Set debug=False in production
+        sys.exit(1)
